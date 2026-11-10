@@ -220,11 +220,17 @@ def build_write_denied_prefixes(home: str) -> list[str]:
     return [os.path.realpath(p) + os.sep for p in paths]
 
 
-def _safe_root_entries(spec: Optional[str]) -> list[str]:
-    """Absolute entries of a HERMES_WRITE_SAFE_ROOT value; blank and relative ones are dropped
-    (a relative entry would anchor at the process cwd)."""
-    entries = (os.path.expanduser(p.strip()) for p in (spec or "").split(os.pathsep))
-    return [p for p in entries if p and os.path.isabs(p)]
+def _safe_root_entries(spec: Optional[str]) -> set[str]:
+    """Resolved absolute entries of a HERMES_WRITE_SAFE_ROOT value. Blank, relative (would anchor
+    at the process cwd) and unresolvable entries are dropped, so a value with none left counts as
+    absent and the caller falls through to the next layer instead of going unrestricted."""
+    roots: set[str] = set()
+    for entry in (spec or "").split(os.pathsep):
+        entry = os.path.expanduser(entry.strip())
+        if entry and os.path.isabs(entry):
+            with suppress(OSError, ValueError):
+                roots.add(os.path.realpath(entry))
+    return roots
 
 
 def get_safe_write_roots() -> set[str]:
@@ -235,15 +241,10 @@ def get_safe_write_roots() -> set[str]:
     from agent.secret_scope import current_secret_scope, load_env_file
 
     key = "HERMES_WRITE_SAFE_ROOT"
-    entries = (_safe_root_entries((current_secret_scope() or {}).get(key))
-               or _safe_root_entries(os.getenv(key))
-               # Floor: a single-profile process without its own line still gets the shared value.
-               or _safe_root_entries(load_env_file(_hermes_root_path() / ".env").get(key)))
-    roots: set[str] = set()
-    for path in entries:
-        with suppress(OSError, ValueError):
-            roots.add(os.path.realpath(path))
-    return roots
+    return (_safe_root_entries((current_secret_scope() or {}).get(key))
+            or _safe_root_entries(os.getenv(key))
+            # Floor: a single-profile process without its own line still gets the shared value.
+            or _safe_root_entries(load_env_file(_hermes_root_path() / ".env").get(key)))
 
 
 # Per-profile files another profile must never rewrite with the file tools: secrets (a planted
@@ -329,7 +330,9 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
         resolved in build_write_denied_paths(home)
         or any(resolved.startswith(prefix) for prefix in build_write_denied_prefixes(home))
         for home in homes
-    ) or resolved in _profile_control_files():
+    # A control file at or under the path also denies it, so renaming/deleting a profile dir
+    # (or ``profiles/``) cannot sidestep the exact-file deny: move out, edit .env, move back.
+    ) or any(_is_under(cf, resolved) for cf in _profile_control_files()):
         return "credential"
 
     for base in _hermes_dirs():

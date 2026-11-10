@@ -86,6 +86,13 @@ def test_entries_are_stripped_and_relative_dropped(layout, monkeypatch):
     assert fs.get_safe_write_roots() == {os.path.realpath(layout["a_only"])}
 
 
+def test_unresolvable_entry_counts_as_absent(layout, scope):
+    # realpath rejects an embedded NUL; the layer must fall through, never go unrestricted.
+    scope({KEY: "/x\x00y"})
+    assert fs.get_safe_write_roots() == {os.path.realpath(layout["shared"])}
+    assert _denied(layout["a_only"] / "x.md")
+
+
 def test_copied_context_inherits_scope(layout, scope):
     scope({KEY: str(layout["a_only"])})
     ctx = contextvars.copy_context()
@@ -163,3 +170,12 @@ class TestFileOperationPaths:
         res = ops.move_file(str(src), str(victim))
         assert res.error and "protected" in res.error
         assert victim.read_text(encoding="utf-8") == "SAFE=1\n" and src.exists()
+
+    def test_profile_dir_rename_denied(self, ops, victim, layout):
+        """Rename out, edit .env, rename back must fail at the first step (also for profiles/)."""
+        b = victim.parent
+        for src, dst in ((b, layout["root"] / "b-tmp"), (b.parent, layout["root"] / "p-tmp")):
+            res = ops.move_file(str(src), str(dst))
+            assert res.error and "protected" in res.error, src
+            assert not dst.exists()
+        assert victim.read_text(encoding="utf-8") == "SAFE=1\n"
