@@ -220,13 +220,51 @@ def build_write_denied_prefixes(home: str) -> list[str]:
     return [os.path.realpath(p) + os.sep for p in paths]
 
 
+def _safe_root_entries(spec: Optional[str]) -> list[str]:
+    """Absolute entries of a HERMES_WRITE_SAFE_ROOT value; blank and relative ones are dropped
+    (a relative entry would anchor at the process cwd)."""
+    entries = (os.path.expanduser(p.strip()) for p in (spec or "").split(os.pathsep))
+    return [p for p in entries if p and os.path.isabs(p)]
+
+
 def get_safe_write_roots() -> set[str]:
-    """Resolved HERMES_WRITE_SAFE_ROOT paths (``os.pathsep``-separated list)."""
+    """Resolved HERMES_WRITE_SAFE_ROOT paths (``os.pathsep``-separated list) for the profile this
+    call serves. First usable value wins: the bound profile scope (a profile's ``.env`` line
+    REPLACES the shared value), then the process env, then the root ``.env``. A profile can
+    narrow its roots but never clear them, and an unbound call never sees a profile's value."""
+    from agent.secret_scope import current_secret_scope, load_env_file
+
+    key = "HERMES_WRITE_SAFE_ROOT"
+    entries = (_safe_root_entries((current_secret_scope() or {}).get(key))
+               or _safe_root_entries(os.getenv(key))
+               # Floor: a single-profile process without its own line still gets the shared value.
+               or _safe_root_entries(load_env_file(_hermes_root_path() / ".env").get(key)))
     roots: set[str] = set()
-    for path in filter(None, os.getenv("HERMES_WRITE_SAFE_ROOT", "").split(os.pathsep)):
+    for path in entries:
         with suppress(OSError, ValueError):
-            roots.add(os.path.realpath(os.path.expanduser(path)))
+            roots.add(os.path.realpath(path))
     return roots
+
+
+# Per-profile files another profile must never rewrite with the file tools: secrets (a planted
+# HERMES_WRITE_SAFE_ROOT line widens that profile's roots) and, for other profiles, config.yaml
+# (it holds their toolsets and approval settings).
+_PROFILE_SECRET_FILES = (".env", ".op.env")
+
+
+def _profile_control_files() -> set[str]:
+    """Realpaths of every profile's ``.env``/``.op.env`` (default = the root) and of every other
+    named profile's ``config.yaml`` (the root's stays user-editable, #45947)."""
+    root = _hermes_root_path()
+    active = os.path.realpath(_hermes_home_path())
+    out = {os.path.realpath(root / n) for n in _PROFILE_SECRET_FILES}
+    with suppress(OSError):
+        for home in (root / "profiles").iterdir():
+            names = _PROFILE_SECRET_FILES
+            if os.path.realpath(home) != active:
+                names = (*names, "config.yaml")
+            out.update(os.path.realpath(home / n) for n in names)
+    return out
 
 
 def build_write_approval_paths(home: str) -> set[str]:
@@ -291,7 +329,7 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
         resolved in build_write_denied_paths(home)
         or any(resolved.startswith(prefix) for prefix in build_write_denied_prefixes(home))
         for home in homes
-    ):
+    ) or resolved in _profile_control_files():
         return "credential"
 
     for base in _hermes_dirs():
